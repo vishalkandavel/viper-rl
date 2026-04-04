@@ -1,397 +1,321 @@
+"""
+VIPER RL 
+"""
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Dirichlet
-import matplotlib.pyplot as plt
-import pandas as pd
 import torch.nn.functional as F
+import torch.optim as optim
+import pandas as pd
 
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Data loading
+print("Loading stock data...")
+data = pd.read_csv(".gitignore/all_stocks.csv")
+data = data[['date', 'Name', 'close']].sort_values('date')
+price_matrix = data.pivot(index='date', columns='Name', values='close').dropna(axis=1)
+returns_np = np.log(price_matrix / price_matrix.shift(1)).dropna()
+returns_raw = torch.tensor(returns_np.values[:, :10], dtype=torch.float32)
 
-def load_real_data(path="all_stocks.csv", K=10):
-    data = pd.read_csv(path)
-    data = data[['date', 'Name', 'close']]
-    data['date'] = pd.to_datetime(data['date'])
-    data = data.sort_values(by='date')
+T, N = returns_raw.shape
+print(f"✓ Loaded {T} timesteps, {N} assets\n")
 
-    price_matrix = data.pivot(index='date', columns='Name', values='close')
-    price_matrix = price_matrix.dropna(axis=1)
-
-    returns_np = np.log(price_matrix / price_matrix.shift(1)).dropna()
-    returns_raw = torch.tensor(returns_np.values, dtype=torch.float32)
-
-    # normalized version for learning
-    returns = (returns_raw - returns_raw.mean(dim=0)) / (returns_raw.std(dim=0) + 1e-8)
-
-    T, TOTAL_ASSETS = returns.shape
-    idx = torch.randperm(TOTAL_ASSETS)[:K]
-    returns = returns[:, idx]
-    returns_raw = returns_raw[:, idx]
-
-    print(f"Using {K} assets | Shape: {returns.shape}")
-    return returns, returns_raw
-
-returns, returns_raw = load_real_data(K=10)
-T, N = returns.shape
-
-# State representation
-
+# Get 20-day rolling stats as state
 window = 20
 
 def get_state(returns, t):
+    """Get mean/std/last from past window"""
     if t < window:
-        return torch.zeros(3*N)
-    w = returns[t-window:t]
+        return torch.zeros(3 * N)
+    w = returns[t - window:t]
     mean = w.mean(dim=0)
-    std = w.std(dim=0)
+    std = w.std(dim=0) + 1e-8
     last = w[-1]
     return torch.cat([mean, std, last])
 
-states = torch.stack([get_state(returns, t) for t in range(window, T)])
+states_raw = torch.stack([get_state(returns_raw, t) for t in range(window, T)])
+print(f"State shape: {states_raw.shape}\n")
 
-# VAE for latent state representation
-
+# VAE for state compression
 class VAE(nn.Module):
-    def __init__(self, input_dim, latent_dim=5):
+    def __init__(self, input_dim=30, latent_dim=5):
         super().__init__()
         self.enc = nn.Sequential(
-            nn.Linear(input_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU()
+            nn.Linear(input_dim, 16), nn.ReLU(),
+            nn.Linear(16, 8), nn.ReLU(),
         )
-        self.mu = nn.Linear(16, latent_dim)
-        self.logvar = nn.Linear(16, latent_dim)
-
+        self.fc_mu = nn.Linear(8, latent_dim)
+        self.fc_logvar = nn.Linear(8, latent_dim)
+        
         self.dec = nn.Sequential(
-            nn.Linear(latent_dim, 16), nn.ReLU(),
-            nn.Linear(16, 32), nn.ReLU(),
-            nn.Linear(32, input_dim)
+            nn.Linear(latent_dim, 8), nn.ReLU(),
+            nn.Linear(8, 16), nn.ReLU(),
+            nn.Linear(16, input_dim),
         )
-
+    
     def encode(self, x):
         h = self.enc(x)
-        return self.mu(h), self.logvar(h)
-
-    def sample(self, mu, logvar):
+        return self.fc_mu(h), self.fc_logvar(h)
+    
+    def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
+    
     def decode(self, z):
         return self.dec(z)
-
+    
     def forward(self, x):
         mu, logvar = self.encode(x)
-        z = self.sample(mu, logvar)
-        recon = self.decode(z)
-        return recon, mu, logvar
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
 
-vae = VAE(states.shape[1], 5)
-opt_vae = optim.Adam(vae.parameters(), lr=1e-3)
+# Train VAE
+vae = VAE(input_dim=30, latent_dim=5)
+vae_opt = optim.Adam(vae.parameters(), lr=0.001)
 
-print("Initializing VAE...")
-for epoch in range(3):
-    recon, mu, logvar = vae(states)
-    recon_loss = ((recon - states)**2).mean()
-    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    loss = recon_loss + 0.001 * kl
-
-    opt_vae.zero_grad()
+for epoch in range(10):
+    vae_opt.zero_grad()
+    recon, mu, logvar = vae(states_raw)
+    
+    mse = F.mse_loss(recon, states_raw)
+    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    loss = mse + 0.001 * kl
+    
     loss.backward()
-    opt_vae.step()
+    vae_opt.step()
 
-print(f"VAE initialized.")
+print("✓ VAE trained\n")
 
-for p in vae.parameters():
-    p.requires_grad = False
-
-# Trading environment
-
-class Env:
-    def __init__(self, returns, returns_raw):
-        self.returns = returns
-        self.returns_raw = returns_raw
-        self.T = returns.shape[0]
-
-    def reset(self):
-        self.t = window
-        return get_state(self.returns, self.t)
-
-    def step(self, action):
-        r = self.returns_raw[self.t]
-        reward = torch.dot(action, r)
-
-        self.t += 1
-        done = self.t >= self.T - 1
-
-        next_state = get_state(self.returns, self.t) if not done else torch.zeros(3*N)
-        return next_state, reward, done
-
-# Actor-critic networks
-
+# Actor and Critic
 class Actor(nn.Module):
-    def __init__(self, input_dim, N):
+    def __init__(self, latent_dim, n_assets):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, N)
+            nn.Linear(latent_dim, 32), nn.ReLU(),
+            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(16, n_assets),
         )
-
-    def forward(self, x):
-        return F.softplus(self.net(x)) + 0.1
+    
+    def forward(self, z):
+        logits = self.net(z)
+        return torch.softmax(logits, dim=-1)
 
 class Critic(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, latent_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(latent_dim, 32), nn.ReLU(),
+            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(16, 1),
         )
-
-    def forward(self, x):
-        return self.net(x)
-
-# Defender policy with actor-critic
-
-class Defender:
-    def __init__(self):
-        self.env = Env(returns, returns_raw)
-        self.actor = Actor(3*N, N)
-        self.critic = Critic(3*N)
-
-        self.opt_a = optim.Adam(self.actor.parameters(), lr=1e-3)
-        self.opt_c = optim.Adam(self.critic.parameters(), lr=5e-4)
-
-    def get_perturbed_state(self, raw_state, delta):
-        """Perturb state through VAE latent space - used in training (no grads)"""
-        with torch.no_grad():
-            mu, logvar = vae.encode(raw_state.unsqueeze(0))
-        
-        z_perturbed = mu + delta.unsqueeze(0)
-        
-        with torch.no_grad():
-            perturbed_state = vae.decode(z_perturbed).squeeze(0)
-        
-        return perturbed_state
     
-    def get_perturbed_state_for_attack(self, raw_state, delta):
-        """Perturb state for attack loss (ALLOWS gradient flow through delta)"""
-        # Compute mu without gradient
-        with torch.no_grad():
-            mu, logvar = vae.encode(raw_state.unsqueeze(0))
-        
-        # Detach mu explicitly and add gradient-enabled delta
-        mu = mu.detach()
-        z_perturbed = mu + delta.unsqueeze(0)
-        
-        # Decode with gradient enabled ONLY for delta path
-        # (VAE params are frozen so no gradients through decoder anyway)
-        perturbed_state = vae.decode(z_perturbed).squeeze(0)
-        
-        return perturbed_state
+    def forward(self, z):
+        return self.net(z)
 
-    def train(self, delta, episodes=15):
-        """Train actor-critic against delta"""
-        for ep in range(episodes):
-            state = self.env.reset()
-            done = False
-
-            while not done:
-                s = self.get_perturbed_state(state, delta)
-                
-                alpha = self.actor(s)
-                dist = Dirichlet(alpha)
-                action = dist.rsample()
-                logp = dist.log_prob(action)
-
-                next_state, reward, done = self.env.step(action)
-
-                # Minimal reward clipping (don't squash signal)
-                reward = torch.clamp(reward, -1, 1)
-
-                v = self.critic(s)
-                with torch.no_grad():
-                    if not done:
-                        s_next = self.get_perturbed_state(next_state, delta)
-                        v_next = self.critic(s_next)
-                    else:
-                        v_next = torch.tensor(0.0)
-
-                td = reward + 0.99 * v_next - v
-
-                # CRITIC: Update value function
-                self.opt_c.zero_grad()
-                critic_loss = td**2
-                critic_loss.backward(retain_graph=True)  # KEEP GRAPH for actor
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                self.opt_c.step()
-
-                # Actor update with entropy regularization for exploration
-                self.opt_a.zero_grad()
-                entropy = dist.entropy()
-                actor_loss = -logp * td.detach() - 0.01 * entropy
-                actor_loss.backward(retain_graph=False)
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                self.opt_a.step()
-
-                state = next_state
-
-    def evaluate(self, delta, steps=None):
-        """Evaluate policy - returns annualized metrics"""
-        if steps is None:
-            steps = 500  # Full remaining trajectory
-        
-        state = self.env.reset()
-        rewards = []
-
-        for _ in range(steps):
-            s = self.get_perturbed_state(state, delta)
-            alpha = self.actor(s)
-            action = Dirichlet(alpha).mean  # Deterministic for evaluation
-            
-            state, reward, done = self.env.step(action)
-            rewards.append(reward.detach().item())
-
-            if done:
-                break
-
-        rewards = np.array(rewards)
-        n_days = len(rewards)
-        
-        # Annualized return
-        log_return = rewards.sum()
-        ann_ret = (np.exp(log_return * (252 / n_days)) - 1) * 100
-        
-        # Sharpe (annualized)
-        sharpe = (rewards.mean() / (rewards.std() + 1e-8)) * np.sqrt(252)
-        
-        # Max drawdown
-        cumsum = np.cumsum(rewards)
-        peak = np.maximum.accumulate(cumsum)
-        dd = cumsum - peak
-        max_dd = dd.min()
-        
-        # Calmar
-        calmar = (ann_ret / 100) / (-max_dd + 1e-8) if max_dd < 0 else 0
-        
-        return ann_ret, sharpe, max_dd, calmar
-
-    def get_attack_loss(self, delta):
-        """Compute loss for adversary (gradients flow through delta)"""
-        state = self.env.reset()
-        rewards = []
-
-        for _ in range(100):  # Shorter window = stronger gradient signal
-            s = self.get_perturbed_state_for_attack(state, delta)  # Use gradient-enabled version
-            alpha = self.actor(s)
-            action = Dirichlet(alpha).rsample()
-
-            state, reward, done = self.env.step(action)
-            rewards.append(reward)
-
-            if done:
-                break
-
-        if len(rewards) == 0:
-            return torch.tensor(0.0, requires_grad=True)
-            
-        rewards_tensor = torch.stack(rewards)
-        total_ret = rewards_tensor.sum()
-        
-        # Adversary wants to MINIMIZE this
-        return total_ret
-
-# Adversary attack mechanism
-
-class Adversary:
-    def __init__(self):
-        self.lam = 0.00001
-
-    def attack(self, defender, steps=20):
-        """Optimize latent perturbation to minimize defender returns"""
-        delta = nn.Parameter(torch.randn(5) * 0.1)
-        opt = optim.Adam([delta], lr=0.5)
-
-        for s_idx in range(steps):
-            opt.zero_grad()
-            defender_return = defender.get_attack_loss(delta)
-            loss = -defender_return + self.lam * torch.norm(delta)
-            loss.backward()
-            opt.step()
-
-            with torch.no_grad():
-                delta.clamp_(-3.0, 3.0)
-
-        return delta.detach()
-
-# Baseline equal-weight portfolio
-
-def evaluate_equal_weight(env, steps=None):
-    """Equal weight (1/N) portfolio baseline"""
-    if steps is None:
-        steps = 500
+# Eval function - log returns for compound calculations, convert to simple for Sharpe
+def eval_portfolio(weights, returns, steps=1258):
+    daily_ret = []
+    for t in range(min(steps, returns.shape[0])):
+        daily_ret.append(torch.dot(weights, returns[t]).item())
     
-    state = env.reset()
-    rewards = []
+    daily_ret = np.array(daily_ret)
+    n = len(daily_ret)
+    
+    # Annualized return from log returns
+    total_log_ret = daily_ret.sum()
+    ann_ret = (np.exp(total_log_ret * (252 / n)) - 1) * 100 if n > 0 else 0
+    
+    # Convert log returns to simple for proper risk metrics
+    simple_ret = np.exp(daily_ret) - 1
+    
+    # Sharpe from simple returns
+    sharpe = (simple_ret.mean() / max(simple_ret.std(), 1e-4)) * np.sqrt(252)
+    
+    # Max drawdown in % wealth loss terms 
+    cs = np.cumsum(daily_ret)
+    peak = np.maximum.accumulate(cs)
+    max_dd_log = (cs - peak).min() if len(cs) > 0 else 0
+    max_dd = (1 - np.exp(max_dd_log)) * 100  # Convert to % loss
+    
+    # Calmar - return % / drawdown %
+    calmar = ann_ret / max(max_dd, 1e-8)
+    
+    # Sortino - downside risk from simple returns
+    downside = simple_ret[simple_ret < 0]
+    downside_std = np.std(downside) if len(downside) > 0 else simple_ret.std()
+    sortino = (simple_ret.mean() / max(downside_std, 1e-4)) * np.sqrt(252)
+    
+    # Win rate
+    win_rate = (simple_ret > 0).sum() / len(simple_ret) * 100 if len(simple_ret) > 0 else 0
+    
+    return ann_ret, sharpe, max_dd, calmar, sortino, win_rate
 
-    for _ in range(steps):
-        action = torch.ones(N) / N
-        state, reward, done = env.step(action)
-        rewards.append(reward.detach().item())
+print("="*75)
+print("VIPER RL: ADVERSARIAL PORTFOLIO ROBUSTNESS")
+print("="*75)
 
-        if done:
-            break
+# Baseline - equal weight
+print("\n[1] BASELINE (Equal Weight)")
+print("-" * 75)
 
-    rewards = np.array(rewards)
-    n_days = len(rewards)
-    log_return = rewards.sum()
-    ann_ret = (np.exp(log_return * (252 / n_days)) - 1) * 100
+w_baseline = torch.ones(N) / N
+base_ret, base_sharpe, base_mdd, base_calmar, base_sortino, base_wr = eval_portfolio(w_baseline, returns_raw, steps=1258)
 
-    return ann_ret
+print(f"Return:     {base_ret:7.2f}%")
+print(f"Sharpe:     {base_sharpe:7.3f}")
+print(f"Max DD:     {base_mdd:8.6f}")
+print(f"Calmar:     {base_calmar:7.3f}")
+print(f"Sortino:    {base_sortino:7.3f}")
+print(f"Win Rate:   {base_wr:6.1f}%\n")
 
-# Stackelberg game loop
+# Train a policy
+print("[2] TRAINING CLEAN POLICY (50 steps)")
+print("-" * 75)
 
-def run():
-    defender = Defender()
-    adv = Adversary()
+actor_weights = nn.Parameter(torch.zeros(N))
+w_opt = optim.Adam([actor_weights], lr=0.01)
 
-    print("\nStackelberg Game: Adversarial Portfolio")
-    print("-" * 50)
+for step in range(50):
+    w_opt.zero_grad()
+    
+    w = torch.softmax(actor_weights, dim=0)
+    
+    # just maximize returns on a window
+    ret_sum = 0
+    for t in range(150):
+        ret_sum = ret_sum + torch.dot(w, returns_raw[t])
+    
+    loss = -ret_sum
+    loss.backward()
+    w_opt.step()
 
-    for iteration in range(1):
-        print(f"\nIteration {iteration}")
-        
-        print("Training clean policy...")
-        defender.train(torch.zeros(5), episodes=15)
-        
-        clean_ret, clean_sharpe, clean_mdd, clean_cal = defender.evaluate(torch.zeros(5))
-        bline = evaluate_equal_weight(defender.env)
-        
-        print(f"Clean:    {clean_ret:7.2f}% | Sharpe: {clean_sharpe:6.3f} | Max DD: {clean_mdd:8.6f}")
-        print(f"Baseline: {bline:7.2f}%")
-        
-        print("Generating attack...")
-        delta = adv.attack(defender, steps=20)
-        print(f"Delta norm: {delta.norm().item():.4f}")
-        
-        print("Training robust policy...")
-        defender.train(delta, episodes=15)
-        
-        att_ret, att_sharpe, att_mdd, att_cal = defender.evaluate(delta)
-        print(f"Attacked: {att_ret:7.2f}% | Sharpe: {att_sharpe:6.3f} | Max DD: {att_mdd:8.6f}")
-        
-        perf_drop = clean_ret - att_ret
-        print(f"\nPerformance drop: {perf_drop:+.2f}%")
-        
-        if att_ret > clean_ret:
-            print("Result: Attack helped (not expected)")
-        else:
-            print("Result: Attack reduced performance as expected")
+w_clean_avg = torch.softmax(actor_weights.detach(), dim=0)
 
-if __name__ == "__main__":
-    run()
+clean_ret, clean_sharpe, clean_mdd, clean_calmar, clean_sortino, clean_wr = eval_portfolio(w_clean_avg, returns_raw, steps=1258)
+
+print(f"Return:     {clean_ret:7.2f}%")
+print(f"Sharpe:     {clean_sharpe:7.3f}")
+print(f"Max DD:     {clean_mdd:8.6f}")
+print(f"Calmar:     {clean_calmar:7.3f}")
+print(f"Sortino:    {clean_sortino:7.3f}")
+print(f"Win Rate:   {clean_wr:6.1f}%")
+print(f"vs Baseline: +{clean_ret - base_ret:.2f}%\n")
+
+# Attack baseline
+print("[3] ATTACKING BASELINE")
+print("-" * 75)
+
+delta_base = nn.Parameter(torch.randn(N) * 0.0015)
+atk_opt = optim.Adam([delta_base], lr=0.005)
+
+for step in range(20):
+    atk_opt.zero_grad()
+    
+    w_pert = w_baseline + delta_base
+    w_pert = torch.clamp(w_pert, min=0)
+    w_pert = w_pert / (w_pert.sum() + 1e-8)
+    
+    ret_sum = 0
+    for t in range(150):
+        ret_sum = ret_sum + torch.dot(w_pert, returns_raw[t])
+    
+    atk_loss = ret_sum + 0.01 * torch.norm(delta_base)
+    atk_loss.backward()
+    atk_opt.step()
+    delta_base.data.clamp_(-0.12, 0.12)
+
+w_base_attacked = w_baseline + delta_base.detach()
+w_base_attacked = torch.clamp(w_base_attacked, min=0)
+w_base_attacked = w_base_attacked / (w_base_attacked.sum() + 1e-8)
+
+print(f"Original weights: {w_baseline.tolist()[:3]}... (equal)")
+print(f"Attacked weights: {w_base_attacked.tolist()[:3]}...")
+print(f"Weight shift:     {delta_base.norm().item():.6f}\n")
+
+base_att_ret, base_att_sharpe, base_att_mdd, base_att_calmar, base_att_sortino, base_att_wr = eval_portfolio(w_base_attacked, returns_raw, steps=1258)
+base_attack_impact = base_ret - base_att_ret
+
+print(f"Return:     {base_att_ret:7.2f}%")
+print(f"Sharpe:     {base_att_sharpe:7.3f}")
+print(f"Max DD:     {base_att_mdd:8.6f}")
+print(f"Calmar:     {base_att_calmar:7.3f}")
+print(f"Sortino:    {base_att_sortino:7.3f}")
+print(f"Win Rate:   {base_att_wr:6.1f}%")
+if base_attack_impact > 0:
+    print(f"✗ Returns REDUCED by {base_attack_impact:.2f}pp (attack worked)")
+else:
+    print(f"✓ Returns INCREASED by {-base_attack_impact:.2f}pp (attack failed)")
+print()
+
+# Attack clean policy
+print("[4] ATTACKING CLEAN POLICY")
+print("-" * 75)
+
+delta_clean = nn.Parameter(torch.randn(N) * 0.0015)
+atk_opt2 = optim.Adam([delta_clean], lr=0.005)
+
+for step in range(20):
+    atk_opt2.zero_grad()
+    
+    w_pert = w_clean_avg + delta_clean
+    w_pert = torch.clamp(w_pert, min=0)
+    w_pert = w_pert / (w_pert.sum() + 1e-8)
+    
+    ret_sum = 0
+    for t in range(150):
+        ret_sum = ret_sum + torch.dot(w_pert, returns_raw[t])
+    
+    atk_loss = ret_sum + 0.01 * torch.norm(delta_clean)
+    atk_loss.backward()
+    atk_opt2.step()
+    delta_clean.data.clamp_(-0.12, 0.12)
+
+w_clean_attacked = w_clean_avg + delta_clean.detach()
+w_clean_attacked = torch.clamp(w_clean_attacked, min=0)
+w_clean_attacked = w_clean_attacked / (w_clean_attacked.sum() + 1e-8)
+
+print(f"Original weights: {w_clean_avg.tolist()[:3]}...")
+print(f"Attacked weights: {w_clean_attacked.tolist()[:3]}...")
+print(f"Weight shift:     {delta_clean.norm().item():.6f}\n")
+
+clean_att_ret, clean_att_sharpe, clean_att_mdd, clean_att_calmar, clean_att_sortino, clean_att_wr = eval_portfolio(w_clean_attacked, returns_raw, steps=1258)
+clean_attack_impact = clean_ret - clean_att_ret
+
+print(f"Return:     {clean_att_ret:7.2f}%")
+print(f"Sharpe:     {clean_att_sharpe:7.3f}")
+print(f"Max DD:     {clean_att_mdd:8.6f}")
+print(f"Calmar:     {clean_att_calmar:7.3f}")
+print(f"Sortino:    {clean_att_sortino:7.3f}")
+print(f"Win Rate:   {clean_att_wr:6.1f}%")
+if clean_attack_impact > 0:
+    print(f"✗ Returns REDUCED by {clean_attack_impact:.2f}pp (attack worked)")
+else:
+    print(f"✓ Returns INCREASED by {-clean_attack_impact:.2f}pp (attack failed)")
+print()
+
+# Summary
+print("="*75)
+print("SUMMARY")
+print("="*75)
+
+print(f"\nBaseline:            {base_ret:7.2f}% (Sharpe {base_sharpe:.3f})")
+print(f"  └─ Under Attack:   {base_att_ret:7.2f}% (lost {base_attack_impact:.2f}pp)")
+
+print(f"\nClean Policy:        {clean_ret:7.2f}% (Sharpe {clean_sharpe:.3f})")
+print(f"  └─ Under Attack:   {clean_att_ret:7.2f}% (lost {clean_attack_impact:.2f}pp)")
+
+print(f"\nPolicy improvement: +{clean_ret - base_ret:.2f}%")
+print(f"Robustness gain:    {base_attack_impact - clean_attack_impact:.2f}pp")
+
+if clean_ret > base_ret and clean_attack_impact < base_attack_impact:
+    print("\n✓ Policy is better AND more robust!")
+elif clean_ret > base_ret:
+    print("\n✓ Policy is better (but not more robust to attacks)")
+elif clean_attack_impact < base_attack_impact:
+    print("\n✓ Policy is more robust (but lower returns)")
+else:
+    print("\n✗ Policy is worse")
+
+print("="*75)
