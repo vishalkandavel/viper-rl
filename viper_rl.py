@@ -1,321 +1,382 @@
 """
-VIPER RL 
+VIPER RL - Stackelberg Game for Portfolio Robustness
+Defender: Actor learns robust portfolio weights from latent states
+Attacker: Uses optimization to find adversarial perturbations in latent space
+Game Loop: Alternating optimization (similar to MNIST CNN-VAE)
 """
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 import pandas as pd
+from copy import deepcopy
 
 torch.manual_seed(42)
 np.random.seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print("Loading stock data...")
+print("VIPER RL - Stackelberg Game for Portfolio Robustness")
+print("-" * 80)
+
+# ============================================================================
+# [1] LOAD DATA
+# ============================================================================
+print("\n[1] Loading data...")
+
 data = pd.read_csv(".gitignore/all_stocks.csv")
 data = data[['date', 'Name', 'close']].sort_values('date')
 price_matrix = data.pivot(index='date', columns='Name', values='close').dropna(axis=1)
+
 returns_np = np.log(price_matrix / price_matrix.shift(1)).dropna()
-returns_raw = torch.tensor(returns_np.values[:, :10], dtype=torch.float32)
+returns_data = torch.tensor(returns_np.values[:, :10], dtype=torch.float32).to(device)
 
-T, N = returns_raw.shape
-print(f"✓ Loaded {T} timesteps, {N} assets\n")
+n_days, n_assets = returns_data.shape
+print(f"Data: {n_days} days, {n_assets} assets")
 
-# Get 20-day rolling stats as state
-window = 20
+# ============================================================================
+# [2] CREATE STATE REPRESENTATION
+# ============================================================================
+print("\n[2] Creating states...")
 
-def get_state(returns, t):
-    """Get mean/std/last from past window"""
+WINDOW = 10
+
+def create_state(returns, t, window, n_assets):
     if t < window:
-        return torch.zeros(3 * N)
-    w = returns[t - window:t]
-    mean = w.mean(dim=0)
-    std = w.std(dim=0) + 1e-8
-    last = w[-1]
-    return torch.cat([mean, std, last])
+        return torch.zeros(4 * n_assets, device=device)
+    
+    w_returns = returns[t - window:t]
+    means = w_returns.mean(dim=0)
+    stds = w_returns.std(dim=0) + 1e-8
+    mins = w_returns.min(dim=0)[0]
+    maxs = w_returns.max(dim=0)[0]
+    
+    state = torch.cat([means, stds, mins, maxs])
+    return state
 
-states_raw = torch.stack([get_state(returns_raw, t) for t in range(window, T)])
-print(f"State shape: {states_raw.shape}\n")
+states = torch.stack([create_state(returns_data, t, WINDOW, n_assets) for t in range(WINDOW, n_days)])
+state_dim = states.shape[1]
+print(f"States shape: {states.shape}")
 
-# VAE for state compression
+# ============================================================================
+# [3] VAE - ENCODE STATES TO LATENT
+# ============================================================================
+print("\n[3] Building VAE...")
+
+LATENT_DIM = 10
+
 class VAE(nn.Module):
-    def __init__(self, input_dim=30, latent_dim=5):
+    def __init__(self, state_dim, latent_dim):
         super().__init__()
-        self.enc = nn.Sequential(
-            nn.Linear(input_dim, 16), nn.ReLU(),
-            nn.Linear(16, 8), nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(8, latent_dim)
-        self.fc_logvar = nn.Linear(8, latent_dim)
         
-        self.dec = nn.Sequential(
-            nn.Linear(latent_dim, 8), nn.ReLU(),
-            nn.Linear(8, 16), nn.ReLU(),
-            nn.Linear(16, input_dim),
-        )
+        # Encoder
+        self.fc1 = nn.Linear(state_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc_mu = nn.Linear(32, latent_dim)
+        self.fc_logvar = nn.Linear(32, latent_dim)
+        
+        # Decoder
+        self.fc3 = nn.Linear(latent_dim, 32)
+        self.fc4 = nn.Linear(32, 64)
+        self.fc5 = nn.Linear(64, state_dim)
     
     def encode(self, x):
-        h = self.enc(x)
-        return self.fc_mu(h), self.fc_logvar(h)
+        h = F.relu(self.fc1(x))
+        h = F.relu(self.fc2(h))
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
     
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std
+        z = mu + eps * std
+        return z
     
     def decode(self, z):
-        return self.dec(z)
+        h = F.relu(self.fc3(z))
+        h = F.relu(self.fc4(h))
+        x_recon = self.fc5(h)
+        return x_recon
     
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        x_recon = self.decode(z)
+        return z, mu, logvar, x_recon
 
-# Train VAE
-vae = VAE(input_dim=30, latent_dim=5)
+vae = VAE(state_dim, LATENT_DIM).to(device)
 vae_opt = optim.Adam(vae.parameters(), lr=0.001)
 
-for epoch in range(10):
+# Train VAE
+print("Training VAE...")
+for epoch in range(20):
     vae_opt.zero_grad()
-    recon, mu, logvar = vae(states_raw)
+    z, mu, logvar, x_recon = vae(states)
     
-    mse = F.mse_loss(recon, states_raw)
-    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    loss = mse + 0.001 * kl
+    mse_loss = F.mse_loss(x_recon, states)
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    loss = mse_loss + 0.001 * kl_loss
     
     loss.backward()
     vae_opt.step()
 
-print("✓ VAE trained\n")
+print("VAE trained")
 
-# Actor and Critic
+# Get latent states
+vae.eval()
+with torch.no_grad():
+    latent_states, _, _, _ = vae(states)
+print(f"Latent states: {latent_states.shape}")
+
+# ============================================================================
+# [4] ACTOR-CRITIC - DEFENDER
+# ============================================================================
+print("\n[4] Building Actor-Critic (Defender)...")
+
 class Actor(nn.Module):
     def __init__(self, latent_dim, n_assets):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, n_assets),
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, n_assets),
         )
     
     def forward(self, z):
         logits = self.net(z)
-        return torch.softmax(logits, dim=-1)
+        weights = torch.softmax(logits, dim=-1)
+        return weights
 
 class Critic(nn.Module):
     def __init__(self, latent_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
         )
     
     def forward(self, z):
-        return self.net(z)
+        value = self.net(z)
+        return value
 
-# Eval function - log returns for compound calculations, convert to simple for Sharpe
-def eval_portfolio(weights, returns, steps=1258):
-    daily_ret = []
-    for t in range(min(steps, returns.shape[0])):
-        daily_ret.append(torch.dot(weights, returns[t]).item())
+actor = Actor(LATENT_DIM, n_assets).to(device)
+critic = Critic(LATENT_DIM).to(device)
+
+actor_opt = optim.Adam(actor.parameters(), lr=0.001)
+critic_opt = optim.Adam(critic.parameters(), lr=0.001)
+print("Actor-Critic ready")
+
+# ============================================================================
+# [5] METRICS
+# ============================================================================
+def compute_metrics(weights, returns):
+    """Return, Sharpe, Sortino, Max DD, Win Rate"""
+    daily_log_ret = (weights * returns).sum(dim=1)
+    n = len(daily_log_ret)
     
-    daily_ret = np.array(daily_ret)
-    n = len(daily_ret)
+    # Return
+    total_log = daily_log_ret.sum().item()
+    annual_ret = (np.exp(total_log * 252 / n) - 1) * 100
     
-    # Annualized return from log returns
-    total_log_ret = daily_ret.sum()
-    ann_ret = (np.exp(total_log_ret * (252 / n)) - 1) * 100 if n > 0 else 0
+    # Sharpe
+    simple_ret = torch.exp(daily_log_ret) - 1
+    mean_ret = simple_ret.mean().item()
+    std_ret = simple_ret.std().item()
+    sharpe = (mean_ret / (std_ret + 1e-8)) * np.sqrt(252)
     
-    # Convert log returns to simple for proper risk metrics
-    simple_ret = np.exp(daily_ret) - 1
-    
-    # Sharpe from simple returns
-    sharpe = (simple_ret.mean() / max(simple_ret.std(), 1e-4)) * np.sqrt(252)
-    
-    # Max drawdown in % wealth loss terms 
-    cs = np.cumsum(daily_ret)
-    peak = np.maximum.accumulate(cs)
-    max_dd_log = (cs - peak).min() if len(cs) > 0 else 0
-    max_dd = (1 - np.exp(max_dd_log)) * 100  # Convert to % loss
-    
-    # Calmar - return % / drawdown %
-    calmar = ann_ret / max(max_dd, 1e-8)
-    
-    # Sortino - downside risk from simple returns
+    # Sortino
     downside = simple_ret[simple_ret < 0]
-    downside_std = np.std(downside) if len(downside) > 0 else simple_ret.std()
-    sortino = (simple_ret.mean() / max(downside_std, 1e-4)) * np.sqrt(252)
+    downside_std = downside.std().item() if len(downside) > 0 else std_ret
+    sortino = (mean_ret / (downside_std + 1e-8)) * np.sqrt(252)
+    
+    # Max DD
+    cum_log = torch.cumsum(daily_log_ret, dim=0)
+    running_max = torch.cummax(cum_log, dim=0)[0]
+    max_dd = (1 - torch.exp((cum_log - running_max).min()).item()) * 100
     
     # Win rate
-    win_rate = (simple_ret > 0).sum() / len(simple_ret) * 100 if len(simple_ret) > 0 else 0
+    win_rate = (simple_ret > 0).sum().item() / len(simple_ret) * 100
     
-    return ann_ret, sharpe, max_dd, calmar, sortino, win_rate
+    return {
+        'return': annual_ret,
+        'sharpe': sharpe,
+        'sortino': sortino,
+        'max_dd': max_dd,
+        'win_rate': win_rate,
+    }
 
-print("="*75)
-print("VIPER RL: ADVERSARIAL PORTFOLIO ROBUSTNESS")
-print("="*75)
-
-# Baseline - equal weight
-print("\n[1] BASELINE (Equal Weight)")
-print("-" * 75)
-
-w_baseline = torch.ones(N) / N
-base_ret, base_sharpe, base_mdd, base_calmar, base_sortino, base_wr = eval_portfolio(w_baseline, returns_raw, steps=1258)
-
-print(f"Return:     {base_ret:7.2f}%")
-print(f"Sharpe:     {base_sharpe:7.3f}")
-print(f"Max DD:     {base_mdd:8.6f}")
-print(f"Calmar:     {base_calmar:7.3f}")
-print(f"Sortino:    {base_sortino:7.3f}")
-print(f"Win Rate:   {base_wr:6.1f}%\n")
-
-# Train a policy
-print("[2] TRAINING CLEAN POLICY (50 steps)")
-print("-" * 75)
-
-actor_weights = nn.Parameter(torch.zeros(N))
-w_opt = optim.Adam([actor_weights], lr=0.01)
-
-for step in range(50):
-    w_opt.zero_grad()
+# ============================================================================
+# [6] ATTACKER - FIND ADVERSARIAL PERTURBATIONS
+# ============================================================================
+def attacker_optimize(actor_model, latent_states_subset, returns_subset, n_iter=50):
+    """Find perturbations that minimize portfolio return using gradient ascent"""
+    actor_model.eval()
     
-    w = torch.softmax(actor_weights, dim=0)
+    # Initialize perturbation
+    delta = torch.zeros_like(latent_states_subset, requires_grad=True)
+    delta_opt = optim.Adam([delta], lr=0.01)
     
-    # just maximize returns on a window
-    ret_sum = 0
-    for t in range(150):
-        ret_sum = ret_sum + torch.dot(w, returns_raw[t])
+    best_loss = float('inf')
+    best_delta = delta.data.clone()
     
-    loss = -ret_sum
-    loss.backward()
-    w_opt.step()
-
-w_clean_avg = torch.softmax(actor_weights.detach(), dim=0)
-
-clean_ret, clean_sharpe, clean_mdd, clean_calmar, clean_sortino, clean_wr = eval_portfolio(w_clean_avg, returns_raw, steps=1258)
-
-print(f"Return:     {clean_ret:7.2f}%")
-print(f"Sharpe:     {clean_sharpe:7.3f}")
-print(f"Max DD:     {clean_mdd:8.6f}")
-print(f"Calmar:     {clean_calmar:7.3f}")
-print(f"Sortino:    {clean_sortino:7.3f}")
-print(f"Win Rate:   {clean_wr:6.1f}%")
-print(f"vs Baseline: +{clean_ret - base_ret:.2f}%\n")
-
-# Attack baseline
-print("[3] ATTACKING BASELINE")
-print("-" * 75)
-
-delta_base = nn.Parameter(torch.randn(N) * 0.0015)
-atk_opt = optim.Adam([delta_base], lr=0.005)
-
-for step in range(20):
-    atk_opt.zero_grad()
+    for i in range(n_iter):
+        delta_opt.zero_grad()
+        
+        # Perturbed latent states
+        z_perturbed = latent_states_subset + delta
+        
+        # Get weights
+        weights = actor_model(z_perturbed)
+        
+        # Compute returns (negative because we want to minimize)
+        daily_log_ret = (weights * returns_subset).sum(dim=1)
+        loss = daily_log_ret.mean()  # Minimize return
+        
+        (-loss).backward()
+        delta_opt.step()
+        
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            best_delta = delta.data.clone()
     
-    w_pert = w_baseline + delta_base
-    w_pert = torch.clamp(w_pert, min=0)
-    w_pert = w_pert / (w_pert.sum() + 1e-8)
+    return best_delta.detach()
+
+# ============================================================================
+# [7] MAIN GAME LOOP
+# ============================================================================
+print("\n[5] Game Loop...")
+
+REBAL_FREQ = 15
+TC = 0.001
+PENALTY = 0.1
+NUM_EPISODES = 5
+
+for episode in range(NUM_EPISODES):
+    print(f"\nEpisode {episode + 1}:")
     
-    ret_sum = 0
-    for t in range(150):
-        ret_sum = ret_sum + torch.dot(w_pert, returns_raw[t])
+    # Defender plays: collect trajectory with clean actor
+    print("  Defender: playing on clean data...")
+    actor.eval()
+    weights_clean = []
+    returns_clean = []
     
-    atk_loss = ret_sum + 0.01 * torch.norm(delta_base)
-    atk_loss.backward()
-    atk_opt.step()
-    delta_base.data.clamp_(-0.12, 0.12)
-
-w_base_attacked = w_baseline + delta_base.detach()
-w_base_attacked = torch.clamp(w_base_attacked, min=0)
-w_base_attacked = w_base_attacked / (w_base_attacked.sum() + 1e-8)
-
-print(f"Original weights: {w_baseline.tolist()[:3]}... (equal)")
-print(f"Attacked weights: {w_base_attacked.tolist()[:3]}...")
-print(f"Weight shift:     {delta_base.norm().item():.6f}\n")
-
-base_att_ret, base_att_sharpe, base_att_mdd, base_att_calmar, base_att_sortino, base_att_wr = eval_portfolio(w_base_attacked, returns_raw, steps=1258)
-base_attack_impact = base_ret - base_att_ret
-
-print(f"Return:     {base_att_ret:7.2f}%")
-print(f"Sharpe:     {base_att_sharpe:7.3f}")
-print(f"Max DD:     {base_att_mdd:8.6f}")
-print(f"Calmar:     {base_att_calmar:7.3f}")
-print(f"Sortino:    {base_att_sortino:7.3f}")
-print(f"Win Rate:   {base_att_wr:6.1f}%")
-if base_attack_impact > 0:
-    print(f"✗ Returns REDUCED by {base_attack_impact:.2f}pp (attack worked)")
-else:
-    print(f"✓ Returns INCREASED by {-base_attack_impact:.2f}pp (attack failed)")
-print()
-
-# Attack clean policy
-print("[4] ATTACKING CLEAN POLICY")
-print("-" * 75)
-
-delta_clean = nn.Parameter(torch.randn(N) * 0.0015)
-atk_opt2 = optim.Adam([delta_clean], lr=0.005)
-
-for step in range(20):
-    atk_opt2.zero_grad()
+    with torch.no_grad():
+        for t in range(len(latent_states) - REBAL_FREQ):
+            z_t = latent_states[t]
+            w_t = actor(z_t.unsqueeze(0)).squeeze()
+            weights_clean.append(w_t)
+            returns_clean.append(returns_data[WINDOW + t])
     
-    w_pert = w_clean_avg + delta_clean
-    w_pert = torch.clamp(w_pert, min=0)
-    w_pert = w_pert / (w_pert.sum() + 1e-8)
+    weights_clean = torch.stack(weights_clean)
+    returns_clean = torch.stack(returns_clean)
+    clean_metrics = compute_metrics(weights_clean, returns_clean)
+    print(f"    Clean return: {clean_metrics['return']:.2f}%")
     
-    ret_sum = 0
-    for t in range(150):
-        ret_sum = ret_sum + torch.dot(w_pert, returns_raw[t])
+    # Attacker plays: find perturbations that hurt returns
+    print("  Attacker: finding adversarial perturbations...")
+    delta_attack = attacker_optimize(actor, latent_states[:-REBAL_FREQ], returns_data[WINDOW:WINDOW + len(latent_states) - REBAL_FREQ], n_iter=10)
     
-    atk_loss = ret_sum + 0.01 * torch.norm(delta_clean)
-    atk_loss.backward()
-    atk_opt2.step()
-    delta_clean.data.clamp_(-0.12, 0.12)
+    # Attack: apply perturbations and get weights
+    with torch.no_grad():
+        z_attacked = latent_states[:-REBAL_FREQ] + delta_attack
+        weights_attacked = actor(z_attacked)
+        returns_attacked = returns_data[WINDOW:WINDOW + len(latent_states) - REBAL_FREQ]
+    
+    attacked_metrics = compute_metrics(weights_attacked, returns_attacked)
+    print(f"    Attacked return: {attacked_metrics['return']:.2f}%")
+    print(f"    Attack loss: {attacked_metrics['return'] - clean_metrics['return']:.2f}pp")
+    
+    # Defender adapts: train on adversarial data
+    print("  Defender: training actor-critic on adversarial data...")
+    actor.train()
+    critic.train()
+    
+    for epoch in range(10):
+        actor_opt.zero_grad()
+        critic_opt.zero_grad()
+        
+        weights_adv = actor(z_attacked)
+        values = critic(z_attacked).squeeze()
+        
+        # Compute return
+        daily_ret = (weights_adv * returns_attacked).sum(dim=1)
+        
+        # Advantage
+        advantage = daily_ret - values.detach()
+        
+        # Actor loss: maximize advantage
+        actor_loss = -(advantage * torch.log(weights_adv.sum(dim=1) + 1e-8)).mean()
+        
+        # Critic loss: minimize value error
+        critic_loss = F.smooth_l1_loss(values, daily_ret)
+        
+        total_loss = actor_loss + critic_loss
+        total_loss.backward()
+        
+        actor_opt.step()
+        critic_opt.step()
 
-w_clean_attacked = w_clean_avg + delta_clean.detach()
-w_clean_attacked = torch.clamp(w_clean_attacked, min=0)
-w_clean_attacked = w_clean_attacked / (w_clean_attacked.sum() + 1e-8)
+print("\nGame loop finished")
 
-print(f"Original weights: {w_clean_avg.tolist()[:3]}...")
-print(f"Attacked weights: {w_clean_attacked.tolist()[:3]}...")
-print(f"Weight shift:     {delta_clean.norm().item():.6f}\n")
+# ============================================================================
+# [8] FINAL EVALUATION
+# ============================================================================
+print("\n" + "-" * 80)
+print("[6] Final Evaluation")
+print("-" * 80)
 
-clean_att_ret, clean_att_sharpe, clean_att_mdd, clean_att_calmar, clean_att_sortino, clean_att_wr = eval_portfolio(w_clean_attacked, returns_raw, steps=1258)
-clean_attack_impact = clean_ret - clean_att_ret
+actor.eval()
 
-print(f"Return:     {clean_att_ret:7.2f}%")
-print(f"Sharpe:     {clean_att_sharpe:7.3f}")
-print(f"Max DD:     {clean_att_mdd:8.6f}")
-print(f"Calmar:     {clean_att_calmar:7.3f}")
-print(f"Sortino:    {clean_att_sortino:7.3f}")
-print(f"Win Rate:   {clean_att_wr:6.1f}%")
-if clean_attack_impact > 0:
-    print(f"✗ Returns REDUCED by {clean_attack_impact:.2f}pp (attack worked)")
-else:
-    print(f"✓ Returns INCREASED by {-clean_attack_impact:.2f}pp (attack failed)")
-print()
+# Baseline
+print("\nBaseline (Equal Weight):")
+w_base = torch.ones(n_assets, device=device) / n_assets
+weights_base = []
+returns_base = []
+with torch.no_grad():
+    for t in range(len(latent_states) - REBAL_FREQ):
+        weights_base.append(w_base.clone())
+        returns_base.append(returns_data[WINDOW + t])
 
-# Summary
-print("="*75)
-print("SUMMARY")
-print("="*75)
+weights_base = torch.stack(weights_base)
+returns_base = torch.stack(returns_base)
+metrics_base = compute_metrics(weights_base, returns_base)
 
-print(f"\nBaseline:            {base_ret:7.2f}% (Sharpe {base_sharpe:.3f})")
-print(f"  └─ Under Attack:   {base_att_ret:7.2f}% (lost {base_attack_impact:.2f}pp)")
+print(f"  Return:    {metrics_base['return']:7.2f}%")
+print(f"  Sharpe:    {metrics_base['sharpe']:7.3f}")
+print(f"  Sortino:   {metrics_base['sortino']:7.3f}")
+print(f"  Max DD:    {metrics_base['max_dd']:7.2f}%")
+print(f"  Win Rate:  {metrics_base['win_rate']:7.1f}%")
 
-print(f"\nClean Policy:        {clean_ret:7.2f}% (Sharpe {clean_sharpe:.3f})")
-print(f"  └─ Under Attack:   {clean_att_ret:7.2f}% (lost {clean_attack_impact:.2f}pp)")
+# Trained policy
+print("\nTrained Policy (Clean):")
+weights_policy = []
+returns_policy = []
+with torch.no_grad():
+    for t in range(len(latent_states) - REBAL_FREQ):
+        z_t = latent_states[t]
+        w_t = actor(z_t.unsqueeze(0)).squeeze()
+        weights_policy.append(w_t)
+        returns_policy.append(returns_data[WINDOW + t])
 
-print(f"\nPolicy improvement: +{clean_ret - base_ret:.2f}%")
-print(f"Robustness gain:    {base_attack_impact - clean_attack_impact:.2f}pp")
+weights_policy = torch.stack(weights_policy)
+returns_policy = torch.stack(returns_policy)
+metrics_policy = compute_metrics(weights_policy, returns_policy)
 
-if clean_ret > base_ret and clean_attack_impact < base_attack_impact:
-    print("\n✓ Policy is better AND more robust!")
-elif clean_ret > base_ret:
-    print("\n✓ Policy is better (but not more robust to attacks)")
-elif clean_attack_impact < base_attack_impact:
-    print("\n✓ Policy is more robust (but lower returns)")
-else:
-    print("\n✗ Policy is worse")
+print(f"  Return:    {metrics_policy['return']:7.2f}%")
+print(f"  Sharpe:    {metrics_policy['sharpe']:7.3f}")
+print(f"  Sortino:   {metrics_policy['sortino']:7.3f}")
+print(f"  Max DD:    {metrics_policy['max_dd']:7.2f}%")
+print(f"  Win Rate:  {metrics_policy['win_rate']:7.1f}%")
 
-print("="*75)
+improvement = metrics_policy['return'] - metrics_base['return']
+print(f"\n  Improvement: {improvement:+.2f}pp")
+
+print("\n" + "-" * 80)
+print("Stackelberg game complete")
+print("-" * 80)
